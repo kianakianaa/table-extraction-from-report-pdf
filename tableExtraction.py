@@ -12,7 +12,7 @@ def detect_extract_tables(pdf_path, save_tables=True):
     print('Begin reading pdf...\n')
     
     table_pages = detect_tables(pdf_path)
-    print('Finish detecting tables!')
+    print('Finish detecting tables!') 
     # table_pages = [45]  # combine first few rows 
     
     table_num = 0
@@ -24,7 +24,7 @@ def detect_extract_tables(pdf_path, save_tables=True):
         df_dict_list_all += df_dict_list_page
     
     if save_tables:
-        xlsx_name = Path(pdf_path).stem + '_all' + '.xlsx'
+        xlsx_name = Path(pdf_path).stem + '_all' + '.xlsx'  # all
         xlsx_dir = './output/table'
         xlsx_path = Path(xlsx_dir) / xlsx_name
         xlsx_path.parent.mkdir(parents=True, exist_ok=True) 
@@ -36,6 +36,7 @@ def detect_extract_tables(pdf_path, save_tables=True):
 def get_page_tables_adjusted(pdf_path, page_num, save_tables=True, start_idx=0):
     # extract: tablelist has no title or columns detected, pure list of df
     table_dict, df_dict_flavors = get_best_table_camelot(pdf_path, ",".join(map(str, [page_num+1])))  
+    # print(table_dict['df'])
     
     # refine/cleaning: go through each one
     # element in df_dict_list = {'title': title, 'df': df, 'page': page_string, bbox':bbox} for each table
@@ -541,11 +542,15 @@ def clean_table_df(df):
                 return all(is_punctuation(str(cell)) for cell in row)
             
             non_cols  = df.iloc[row].isna().tolist()
+            num = df.shape[1]
             check_cols = [idx for idx in range(1, df.shape[1])]  # if non_cols[idx]==0]
             df_up = df.iloc[row - 1].fillna('_').tolist()
             df_row = df.iloc[row].fillna('_').tolist()
             df_dw = df.iloc[row+1].fillna('_').tolist()
-            num = df.shape[1]
+            
+            df_up_row_none = df.iloc[row-1:row+1].fillna('').map(lambda x: 1 if x=='' else 0)
+            list_combined_none = df_up_row_none.sum(axis=0).tolist()
+            
             if all(df_up[idx] == '_' for idx in check_cols) and all(df_dw[idx] == '_' for idx in check_cols):
                 df_bf = df.iloc[:row-1]
                 df_af = df.iloc[row+2:]
@@ -556,13 +561,22 @@ def clean_table_df(df):
                 df_bf = df.iloc[:row-1]
                 df_af = df.iloc[row+1:]
                 df_md = pd.DataFrame([[df_up[i] + df_row[i] for i in range(num)]], columns=df.columns)
-                df_md = df_md.apply(lambda col: col.str.replace('_', ' '))
+                df_md = df_md.apply(lambda col: col.str.replace('_', ' ').str.strip())
                 df_new = pd.concat([df_bf, df_md, df_af], axis=0, ignore_index=True).reset_index(drop=True)
             # add: the whole row only has punctuation but no real stuff
             elif all(is_only_punctuation(str(cell)) for cell in df_row):
                 df_bf = df.iloc[:row]
                 df_af = df.iloc[row+1:]
                 df_new = pd.concat([df_bf, df_af], axis=0, ignore_index=True)   
+                
+            # intertwined missing value between rows (two rows for now)
+            elif len(list_combined_none) >= 3 and all(x == 1 for x in list_combined_none[1:]):
+                df_bf = df.iloc[:row-1]
+                df_md = pd.DataFrame([[df_up[i] + df_row[i] for i in range(num)]], columns=df.columns)
+                df_md = df_md.apply(lambda col: col.str.replace('_', ' ').str.strip())
+                df_af = df.iloc[row+1:]
+                df_new = pd.concat([df_bf, df_md, df_af], axis=0, ignore_index=True).reset_index(drop=True)
+                        
             else:
                 df_new = df.copy()
             
