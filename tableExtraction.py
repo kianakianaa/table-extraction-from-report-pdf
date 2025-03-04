@@ -9,10 +9,11 @@ from pathlib import Path
 
 
 def detect_extract_tables(pdf_path, save_tables=True):
+    print('Begin reading pdf...\n')
+    
     table_pages = detect_tables(pdf_path)
     print('Finish detecting tables!')
-    # table_pages = [98]
-    # display_table_box(pdf_path, bbox, page_num=table_pages[0], plumber_ordinate=1)
+    # table_pages = [45]  # combine first few rows 
     
     table_num = 0
     df_dict_list_all = []
@@ -43,8 +44,6 @@ def get_page_tables_adjusted(pdf_path, page_num, save_tables=True, start_idx=0):
         df_dict_list[i]['bbox'] = table_dict['bbox'][i]
         df_dict_list[i]['page'] = page_num
     df_dict_list = [df_dict for df_dict in df_dict_list if not df_dict['df'].empty]
-    if page_num == 103:
-        print([df_dict['df'] for df_dict in df_dict_list])
     
     if len(df_dict_list) == 0:
         print(f'No table for page {page_num}')
@@ -55,7 +54,6 @@ def get_page_tables_adjusted(pdf_path, page_num, save_tables=True, start_idx=0):
     # update bbox
     # refined_plumber_bbox = find_table_position(table_df, pdf_file, table_bbox, page_num=0)
     df_dict_list_1 = list(map(lambda df_dict: {**df_dict, 'bbox': find_table_position(df_dict['df'], pdf_path, df_dict['bbox'], page_num)}, df_dict_list))
-    # print(f'df_dict_list bbox: {[df_dict['bbox'] for df_dict in df_dict_list_1]}')
     # adjust column order  (page_num=0)
     df_dict_list_2 = list(map(lambda df_dict_1: {**df_dict_1, 'df': adjust_column_name_order(df_dict_1['bbox'], df_dict_1['df'], pdf_path, page_num)}, df_dict_list_1))
     if [df_dict for df_dict in df_dict_list_2 if len(df_dict['df'])>0]:
@@ -99,6 +97,85 @@ def read_tables_camelot(src, flavor, pages):
 
 def get_best_table_camelot(pdf_path, pages='all'):
     
+    def separate_tables(df):
+        first_text = df.iloc[0].dropna().tolist()
+        first_text = [x for x in first_text if x != '']
+        if len(first_text)>=4:
+            if len(first_text)%2 == 0:
+                first_half = first_text[:int(len(first_text)/2)]
+                second_half = first_text[int(len(first_text)/2):]
+                if len(first_half) >2 and first_half[1:] == second_half[1:]:
+                    element = str(first_half[-1])
+                    match = df.iloc[0].apply(lambda x: str(x).strip() == element)
+                    true_indices = match[match].index
+                    if true_indices.any():
+                        # print(f'match:{true_indices}')
+                        column_index = true_indices[0]
+                        # print(f'column_index:{column_index}')
+                        df_list = [df.iloc[:, :column_index+1], df.iloc[:, column_index+1:]]
+                        # print(f'separate:\n{df_list[0]}')
+                        return df_list 
+            else:
+                first_half = first_text[:int((len(first_text)-1)/2)]
+                second_half = first_text[int((len(first_text)-1)/2):]
+                if len(set(first_half) & set(second_half)) == (len(first_text)-1)/2:
+                    match = df.iloc[0].apply(lambda x: str(x).strip() == element)
+                    true_indices = match[match].index
+                    if true_indices.any():
+                        # print(f'match:{true_indices}')
+                        column_index = true_indices[0]
+                        df_list = [df.iloc[:, :column_index+1], df.iloc[:, column_index+1:]]
+                        # print(f'\nseparate tables:\n{df_list[1]},\n{df.iloc[1]}')
+                        return df_list
+        
+        # although there is no repeatec column names, repeated None structure
+        # Iterate over each row to find the column where the NaN starts and all after are NaN
+        def find_column_index(row):
+            if len(row) <=4:
+                return None
+            for i in range(1, len(row)-1):
+                if pd.isna(row[i]):  # If the value is NaN
+                    # Check if all values after this column are also NaN
+                    if all(pd.isna(row[i:])):
+                        if i <=3:
+                            return None
+                        else:
+                            return i
+            return None
+        num = df.shape[0]
+        df_1 = df.replace({None: pd.NA, '': pd.NA})
+        df_1.columns = list(range(df.shape[1]))
+        susp_col_idx = df_1.apply(find_column_index, axis=1)
+        susp_col_idx = [x for x in susp_col_idx if pd.notna(x) and str(int(x)).isdigit()]
+        # print(f'susp_col_idx:{susp_col_idx}')
+        if len(set(susp_col_idx))<=5 and len(susp_col_idx)/num>0.3 and len(susp_col_idx)>=10:
+            col = int(sorted(susp_col_idx)[0])
+            print(f'Find start of NAN col:{col}')
+            df_list = [df.iloc[:, :col], df.iloc[:, col:]]
+            return df_list
+        
+        # check the last column
+        if df.shape[1] > 4:
+            df_last = df.iloc[1:, -1].replace({None: pd.NA, "": pd.NA}).dropna()
+            if len(df_last) < 3:
+                return [df]
+            # print(f'df_last: \n{df_last}')
+            df_count_n = df_last.apply(lambda x: x.count('\n'))
+            num = len([e for e in df_count_n.values if e>0])
+            perc = num/len(df_last)
+            # print(f'df_count_n:\n{df_count_n}', '\n', perc)
+            if len(set(df_count_n.values)) <= 2 and perc>=0.8: 
+                print('Separate last column!')
+                df_1 = df.iloc[:, :-1]
+                df_2 = df.iloc[:, -1]
+                df_split = df_2.str.split('\n', expand=True)
+                df_split.columns = [i for i in range(df_split.shape[1])]
+                df_list = [df_1, df_split]
+                return df_list
+            
+                
+        return [df]
+    
     def cal_none_perc(df):
         num_none = df.isna().sum().sum()
         num_total = df.shape[0] * df.shape[1]
@@ -110,6 +187,7 @@ def get_best_table_camelot(pdf_path, pages='all'):
         Goal: remove invalid values 
         if the whole table is invalid, will return an empty dataframe.
         """
+        
         def check_first_col(df):
             df_col = df.iloc[:, 0]
             none_val = df_col.isna().sum()
@@ -157,7 +235,7 @@ def get_best_table_camelot(pdf_path, pages='all'):
             
             def check_capital_pattern(df_obj):
                 df_invalid = pd.DataFrame(0, index=df_obj.index, columns=df_obj.columns)
-                df_cap = df_obj.map(lambda x: int(x[0].isupper()) if isinstance(x, str) and not x[0].isdigit() else x) # only check string upper/lower
+                df_cap = df_obj.map(lambda x: int(x[0].isupper()) if isinstance(x, str) and x and not x[0].isdigit() else x) # only check string upper/lower
                 df_count_pattern = pd.DataFrame([[0]*df_cap.shape[1]], columns=df_cap.columns)
                 for col in df_cap.columns:
                     df_cap_col = df_cap[col]
@@ -205,8 +283,27 @@ def get_best_table_camelot(pdf_path, pages='all'):
                 
                 return df_invalid # df_count_pattern
             
+            
+            def is_obj_column_valid(df, col):
+                # Check if the column is of dtype object and contains less than 10% numeric values or digit strings
+                df_col = df[col]
+                df_col = df_col.str.replace(r'\s+', ' ', regex=True).str.strip()
+                df_col = df_col.str.replace('\xa0', '', regex=True)
+                df_col = df_col.astype(str).apply(lambda x: x.replace('\n', '').replace('-', '').strip())
+                digit_str_count = df_col.str.match(r'^-?[\d,]+(\.\d+)?$').sum()
+                none_value = df_col.isna().sum()
+                total_count = len(df_col) - none_value
+                if total_count == 0:
+                    total_count = 0.01
+                # Calculate the percentage of digit strings
+                digit_percentage = (digit_str_count / total_count) * 100
+
+                return digit_percentage < 10
+            
             obj_cols = df.select_dtypes(include=['object']).columns
-            df_obj = df[obj_cols]
+            obj_cols = [col for col in obj_cols if is_obj_column_valid(df, col)]
+            # print(f'obj_col:{obj_cols}')
+            df_obj = df[obj_cols].map(lambda x: re.sub(r'^\W+', '', x) if isinstance(x, str) else x)
             num_entries = df.shape[0]
             none_array = df_obj.isna().sum().values.reshape(1, -1)
             # check capital pattern
@@ -244,6 +341,8 @@ def get_best_table_camelot(pdf_path, pages='all'):
                 if df_invalid_obj[col][0] >= string_thre or df_invalid_all[col][0] >= string_none_thre:
                     if df[col][:3].str.lower().isin(['unit']).any():
                         continue
+                    # print(df_invalid_obj[col][0], df_invalid_all[col][0])
+                    # print(df[col])
                     df = df.drop(columns=[col])
                     
                 else:
@@ -254,9 +353,11 @@ def get_best_table_camelot(pdf_path, pages='all'):
             
             # avoid df having too many strings
             lengths = df.map(lambda x: len(str(x)) if pd.notna(x) else 0)
-            col_avg_len = lengths.sum().sum()/(df.shape[1])
-            # print(f'col_avg_len:{col_avg_len}')
-            if col_avg_len >= 1000:
+            avg_len = lengths.sum().sum()/(df.map(lambda x: 1 if pd.notna(x) else 0).sum().sum())
+            # print(f'avg_len:{avg_len}')
+            if avg_len >= 40:
+                df = pd.DataFrame()
+            if not df.empty and df.iloc[-1, 0] and df.iloc[-1, 0].count('\n')>3:
                 df = pd.DataFrame()
             
         return df
@@ -267,9 +368,21 @@ def get_best_table_camelot(pdf_path, pages='all'):
     # get results for different flavor
     df_dict = {key: [] for key in flavor_list}
     for flavor in flavor_list:
-        df_list, bbox_list = read_tables_camelot(pdf_path, flavor, pages)
+        # print(f'\nfit flavor {flavor}')
+        df_list_0, bbox_list_0 = read_tables_camelot(pdf_path, flavor, pages)
         df_valid_list = []
         bbox_valid_list = []
+        # separate tables
+        df_list = []
+        bbox_list = []
+        for i, df in enumerate(df_list_0):
+            separated_table_list = separate_tables(df)
+            df_list += separated_table_list
+            if len(separated_table_list) == 1:
+                bbox_list.append(bbox_list_0[i])
+            else:
+                bbox_list += [bbox_list_0[i]]*2
+            
         for i, df in enumerate(df_list):
             # check validness of df
             df = examine_table(df)
@@ -299,10 +412,25 @@ def get_best_table_camelot(pdf_path, pages='all'):
             if len(min_var) == 1:
                 flavor = list(min_var.keys())[0]
                 
-    # print(f'Flavor chosen: {flavor}')      
+    print(f'Flavor chosen: {flavor}')      
     final_table_dict = df_dict[flavor]
     
     return final_table_dict, df_dict # df_dict
+
+def is_non_year_numeric(value):
+    # Remove commas (thousands separators)
+    value = str(value).replace(',', '')
+    # Try to convert the value to a float
+    try:
+        # Convert to float
+        num_value = float(value)
+        if len(str(int(num_value))) == 4:  # check if the number has 4 digits, likely a year
+            return False
+        return True
+    except ValueError:
+        # If it can't be converted to a float, return False
+        return False
+
 
 # cleaning
 def clean_table_df(df):
@@ -320,45 +448,48 @@ def clean_table_df(df):
         combined_2_row_c = [(0 if l.count('')==1 else 1) for l in combined_2_row]
         
         first_row_text = '_'.join(first_row)
+        first_row_nume = sum([int(is_non_year_numeric(e)) for e in first_row])
         num_lines_1 = first_row_text.count('\n')
         second_row_text = '_'.join(second_row)
+        second_row_nume = sum([int(is_non_year_numeric(e)) for e in second_row])
         num_lines_2 = second_row_text.count('\n')  
-        third_row_text = '_'.join(third_row)    
-        num_lines_3 = third_row_text.count('\n')  
-        # Case 1: no missing values in first row -> column names, no title
-        if first_row.count('') == 0 and 2* num_cols > num_lines_1 > max(num_cols-2, 2):
-            # print('First row as cols!')
-            df_1 = df.iloc[1:]
-            cols = first_row
-            df_1.columns = cols
+        third_row_text = '_'.join(third_row)   
+        third_row_nume = sum([int(is_non_year_numeric(e)) for e in third_row]) 
+        num_lines_3 = third_row_text.count('\n') 
         # Case 2: both first and second row has None, but can be combined into one row -> no title, first two rows merge into cols
-        elif sum(combined_2_row_c) == 0:
+        if sum(combined_2_row_c) == 0:
             print('First two rows as cols')
             cols = [str(l[0]) + str(l[1]) for l in combined_2_row]
             df_1 = df.iloc[2:]
             df_1.columns = cols
+        # Case 1: no missing values in first row -> column names, no title
+        elif first_row[1:].count('') == 0 and 2* num_cols > num_lines_1 >=0 and first_row_nume<=2:
+            print('First row as cols!')
+            df_1 = df.iloc[1:]
+            cols = first_row
+            df_1.columns = cols
+        
         # Case 3: two many \n in the first row: first row as cols combined, no title
         elif 2*num_cols > num_lines_1 > max(num_cols-2, 2):
             print('First row as cols, tangled!')
             cols_text = first_row_text.strip('_')
             df_1 = df.iloc[1:]  # df_1.columns = indexRange
         # Case 4: first row not cols, see if the second is cols  (\n count)
-        elif 2*num_cols > num_lines_2 > max(num_cols-2, 2): 
+        elif 2*num_cols > num_lines_2 >=0 and second_row[1:].count('')==0 and second_row_nume<=2: 
              # first two rows are not titles nor cols, third row has no missing values (assume to be col names)
-            if second_row.count('') == 0:
-                print('Second row as cols!')
-                title = first_row_text.strip('_')
-                cols = second_row
-                df_1 = df.iloc[2:]
-                df_1.columns = cols
-            else:
-                print('Second row as cols, tangled!')
-                # print(num_lines_2)
-                cols_text = second_row_text.strip('_')
-                title = first_row_text.strip('_')
-                df_1 = df.iloc[2:]
+            print('Second row as cols!')
+            title = first_row_text.strip('_')
+            cols = second_row
+            df_1 = df.iloc[2:]
+            df_1.columns = cols
+        elif 2*num_cols > num_lines_1 > max(num_cols-2, 2):
+            print('Second row as cols, tangled!')
+            # print(num_lines_2)
+            cols_text = second_row_text.strip('_')
+            title = first_row_text.strip('_')
+            df_1 = df.iloc[2:]
        
-        elif df.iloc[2].isna().sum()==0 and  2*num_cols> num_lines_3 > max(num_cols-2, 2):
+        elif third_row[1:].count('')==0 and  2*num_cols> num_lines_3 >=0 and third_row_nume<=2:
             print('Thrid row as cols')
             title = "|".join([str(l[0]) + '_' + str(l[1]) for l in combined_2_row]).strip('_').strip('|')
             cols = df.iloc[2].tolist()
@@ -419,13 +550,13 @@ def clean_table_df(df):
                 df_bf = df.iloc[:row-1]
                 df_af = df.iloc[row+2:]
                 df_md = pd.DataFrame([[df_up[i] + df_row[i] + df_dw[i] for i in range(num)]], columns=df.columns)
-                df_md = df_md.apply(lambda col: col.str.strip('_'))
+                df_md = df_md.apply(lambda col: col.str.replace('_', ' '))
                 df_new = pd.concat([df_bf, df_md, df_af], axis=0, ignore_index=True).reset_index(drop=True)
             elif all(df_up[idx] == '_' for idx in check_cols):
                 df_bf = df.iloc[:row-1]
                 df_af = df.iloc[row+1:]
                 df_md = pd.DataFrame([[df_up[i] + df_row[i] for i in range(num)]], columns=df.columns)
-                df_md = df_md.apply(lambda col: col.str.strip('_'))
+                df_md = df_md.apply(lambda col: col.str.replace('_', ' '))
                 df_new = pd.concat([df_bf, df_md, df_af], axis=0, ignore_index=True).reset_index(drop=True)
             # add: the whole row only has punctuation but no real stuff
             elif all(is_only_punctuation(str(cell)) for cell in df_row):
@@ -443,6 +574,7 @@ def clean_table_df(df):
         row = 0
         while row < df_3.shape[0]-1:
             df_3 = detect_row(df_3, row)
+            row += 1
                 
         return df_3
     
@@ -491,7 +623,6 @@ def find_table_position(table_df, pdf_file, table_bbox, page_num=0):
     
     with pdfplumber.open(pdf_file) as pdf:
         page = pdf.pages[page_num]  
-        # print(f"Total words extracted: {len(page.extract_words())}, \n{page.extract_words()[0]}")
         # display_table_box(pdf_path, table_bbox, page_num=page_num, plumber_ordinate=0)
         # Convert Camelot bbox to pdfplumber coordinate system
         page_height = page.height  
@@ -537,6 +668,7 @@ def find_table_position(table_df, pdf_file, table_bbox, page_num=0):
             
             a0_result = get_mode_or_min(a0_vals)
             a1_result = get_mode_or_max(a1_vals)
+            # print(f'a0, a1: {a0_result, a1_result}')
 
             return (a0_result, a1_result)
         
@@ -548,41 +680,55 @@ def find_table_position(table_df, pdf_file, table_bbox, page_num=0):
             """
             if axis==0:
                 first_text = table_df.columns.dropna().tolist()
+                first_idx = -1
                 if all(isinstance(x, int) and x < 100 for x in first_text) or len(table_df.columns.dropna().tolist())<2:
-                    first_idx = 0
-                    while len(table_df.iloc[first_idx].dropna().tolist()) < 2:
-                        first_idx +=1
-                        if first_idx >= table_df.shape[0]-1:
-                            return None
-                    first_text = table_df.iloc[first_idx].dropna().tolist()
+                    first_idx = None
+                    for i in range(table_df.shape[0]):  # Iterate over all columns
+                        if len(table_df.iloc[i].dropna().tolist()) > 0:
+                            first_idx = i
+                            break
                     
-                last_idx = -1
-                while len(table_df.iloc[last_idx].dropna().tolist()) == 0:
-                    last_idx -= 1
-                    if -last_idx >= table_df.shape[0]:
-                        return None
-                last_text = table_df.iloc[last_idx].dropna().tolist()
+                if first_idx is None: 
+                    return None, None   
+                elif first_idx != -1:
+                    first_text = table_df.iloc[first_idx].dropna().tolist()
+                
+                last_idx = None
+                for i in range(1, table_df.shape[0] + 1):  # Iterate from the last column
+                    if len(table_df.iloc[-i].dropna().tolist()) >= 2:
+                        last_idx = -i
+                        last_text = table_df.iloc[last_idx].dropna().tolist()
+                        break
+
+                if last_idx is None:
+                    return None, None   
                 
             elif axis==1:
                 # print(table_df.shape, table_df.iloc[:2])
-                first_idx = 0
-                while len(table_df.iloc[:, first_idx].dropna().tolist()) == 0:
-                    first_idx += 1
-                    if first_idx >= table_df.shape[1]-1:
-                        return None
-                first_text = table_df.iloc[:, first_idx].dropna().tolist()
-                # print(f'first column: {first_text}')
+                first_idx = None
+                for i in range(table_df.shape[1]):  # Iterate over all columns
+                    if len(table_df.iloc[:, i].dropna().tolist()) > 0:
+                        first_idx = i
+                        first_text = table_df.iloc[:, first_idx].dropna().tolist()
+                        break
+                if first_idx is None:  # If no non-empty column is found
+                    return None, None   
                 
-                last_idx = -1
-                while len(table_df.iloc[:, last_idx].dropna().tolist())< 2:
-                    last_idx -= 1
-                    if -last_idx >= table_df.shape[1]:
-                        return None
-                last_text = table_df.iloc[:, last_idx].dropna().tolist()
-                # print(f'last column: {last_text}')
+                last_idx = None
+                for i in range(1, table_df.shape[1] + 1):  # Iterate from the last column
+                    if len(table_df.iloc[:, -i].dropna().tolist()) >= 2:
+                        last_idx = -i
+                        # print(f'found last_idx:{last_idx}')
+                        last_text = table_df.iloc[:, last_idx].dropna().tolist()
+                        # print(f'last_text:{last_text}')
+                        break
+                if last_idx is None:
+                    return None, None   
+                
+
             else:
                 print('Wrong axis!')
-                return None
+                return None, None   
             
             first_text = [str(e).split("\n")[0] for e in first_text]
             first_text = [word for e in first_text for word in re.findall(r'\b\d{1,3}(?:,\d{3})*(?:\.\d+)?|\w+\b', str(e))] # prevent separate float
@@ -597,7 +743,7 @@ def find_table_position(table_df, pdf_file, table_bbox, page_num=0):
                 if any(str(cell) in word['text'] for cell in last_text):
                     last_bboxes.append(word)
             if not first_bboxes or not last_bboxes:
-                return None            
+                return None, None           
             
             first_bbox_mode = get_bbox_from_mode_or_m(first_bboxes, axis)
             last_bbox_mode = get_bbox_from_mode_or_m(last_bboxes, axis)
@@ -648,7 +794,7 @@ def save_tables_to_xlsx(df_dict_list, output_path, start_idx):
         name = name[:limit] + '_' + str(page_num)
         return name
     df_dict_list = [df_dict for df_dict in df_dict_list if not df_dict['df'].empty]
-    print(f'Final num of df: {len(df_dict_list)}')
+    print(f'\nFinal num of df: {len(df_dict_list)}')
     # Use ExcelWriter to write multiple sheets
     with pd.ExcelWriter(output_path) as writer:
         for idx, df_dict in enumerate(df_dict_list):
@@ -737,5 +883,4 @@ if __name__ == "__main__":
     pdf_path = "./data/SR/Totalenergies_2024.pdf"
     # pdf_path = "./data/table/Totalenergies_2024 (dragged) 2.pdf"
     df_dict_list = detect_extract_tables(pdf_path, save_tables=True)
-    print(f'Num of sheet extracted: {len(df_dict_list)}')
     
