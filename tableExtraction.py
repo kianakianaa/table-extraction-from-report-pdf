@@ -7,13 +7,13 @@ import matplotlib.pyplot as plt
 from collections import Counter
 from pathlib import Path
 
+# to do (after extraction): interconnection of tables from the same page: missing column/index names
 
 def detect_extract_tables(pdf_path, save_tables=True):
     print('Begin reading pdf...\n')
     
     table_pages = detect_tables(pdf_path)
     print('Finish detecting tables!') 
-    # table_pages = [45]  # combine first few rows 
     
     table_num = 0
     df_dict_list_all = []
@@ -60,7 +60,8 @@ def get_page_tables_adjusted(pdf_path, page_num, save_tables=True, start_idx=0):
     if [df_dict for df_dict in df_dict_list_2 if len(df_dict['df'])>0]:
         print(f'page {page_num} got final df!')
         
-    
+    # check table consistency in the page: missing index/column names
+        
     #  save df_dict_list into xlsx, each df_dict into an independent sheet, with the sheetname being its title (if title is none then just use Sheet + number)
     if save_tables:
         xlsx_name = Path(pdf_path).stem + '.xlsx'
@@ -896,5 +897,6 @@ if __name__ == "__main__":
     # test 
     pdf_path = "./data/SR/Totalenergies_2024.pdf"
     # pdf_path = "./data/table/Totalenergies_2024 (dragged) 2.pdf"
+    pdf_path = './data/SR/LGES_2020.pdf'
     df_dict_list = detect_extract_tables(pdf_path, save_tables=True)
     
