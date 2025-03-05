@@ -186,8 +186,12 @@ def get_best_table_camelot(pdf_path, pages='all'):
     
     def examine_table(df, string_thre = 0.5, string_none_thre = 0.15):
         """ 
-        Goal: remove invalid values 
-        if the whole table is invalid, will return an empty dataframe.
+        Goal: remove invalid values if the whole table is invalid, will return an empty dataframe.
+        
+        Args:
+        - df: dataframe of one table to be checked
+        - string_thre: threshold for checking validness of object columns (remove None values in denominator), 0.5 by default
+        - string_none_thre: threshold for checking validness of object columns (the whole column), 0.15 by default
         """
         
         def check_first_col(df):
