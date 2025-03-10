@@ -6,6 +6,8 @@ import pdfplumber
 import matplotlib.pyplot as plt
 from collections import Counter
 from pathlib import Path
+from shapely.geometry import box
+from shapely.strtree import STRtree
 
 # to do (after extraction): interconnection of tables from the same page: missing column/index names
 
@@ -37,6 +39,7 @@ def get_page_tables_adjusted(pdf_path, page_num, save_tables=True, start_idx=0):
     # extract: tablelist has no title or columns detected, pure list of df
     table_dict, df_dict_flavors = get_best_table_camelot(pdf_path, ",".join(map(str, [page_num+1])))  
     # print(table_dict['df'])
+    # print(df_dict_flavors)
     
     # refine/cleaning: go through each one
     # element in df_dict_list = {'title': title, 'df': df, 'page': page_string, bbox':bbox} for each table
@@ -97,7 +100,64 @@ def read_tables_camelot(src, flavor, pages):
     
     return table_list, position_list
 
-def get_best_table_camelot(pdf_path, pages='all'):
+def get_best_table_camelot(pdf_path, pages='all'):    
+    
+    def complement_cols(df):
+        # for numeric value based tables
+        if df.empty or df.shape[0]<=1 or df.shape[1]<=1:
+            return df
+        numeric_num = (df.iloc[:, 1:].map(pd.to_numeric, errors='coerce').notnull()).sum().sum()
+        numeric_perc = numeric_num/(df.shape[0]*df.shape[1]-df.shape[0])
+        if numeric_perc >= 0.7:
+            if pd.to_numeric(df.iloc[0], errors='coerce').notnull().sum()>1:
+                df_1 = pd.concat([pd.DataFrame([[None]*df.shape[1]]), df]).reset_index(drop=True)
+                return df_1
+        return df
+    
+    def remove_redundant_tables(df_dict_0, page_height):
+        """
+        Background:
+        - There are cases that the table may be extracted multiple times but differently, which may lead the algorithm choosing the wrong option
+        
+        Method:
+        - check bbox
+        - content (TBD)
+        """        
+        # print(f'camelot_bbox:{df_dict_0['bbox']}')
+        bbox_list = [box(b[0], page_height - b[-1], b[2], page_height - b[1]) for b in df_dict_0['bbox']]
+        if len(bbox_list) <= 1:
+            return df_dict_0
+        # R-tree reduces unnecessary comparisons by organizing boxes hierarchically
+        # print('Check containing ..')
+        tree = STRtree(bbox_list)    
+        remove_index_list = []
+        epsilon = 5
+        for i, bbox in enumerate(bbox_list):
+            possible_matches = tree.query(bbox)  # Fast spatial query
+            for j in possible_matches:
+                if i != j:
+                    candidate = bbox_list[j]
+                    # print(f'candidate {candidate}; target:{bbox}')
+                else:
+                    continue
+                if candidate != bbox and candidate.buffer(epsilon).contains(bbox):  # Ensure not the same object(maybe result of separate tables)
+                    # to be safe: check the information density (didn't check content)
+                    # print('Contain inside!')
+                    candi_df = df_dict_0['df'][j]
+                    target_df = df_dict_0['df'][i]
+                    candi_info = candi_df.shape[0]*candi_df.shape[1] - candi_df.isna().sum().sum()
+                    target_info = target_df.shape[0]*target_df.shape[1] - target_df.isna().sum().sum()
+                    if candi_info > target_info:
+                        # print(f'Remove table {i}')
+                        remove_index_list.append(i)
+                        break
+        # update df_list
+        if remove_index_list:
+            df_dict_0['df'] = [df for i, df in enumerate(df_dict_0['df']) if i not in remove_index_list]
+            df_dict_0['bbox'] = [b for i, b in enumerate(df_dict_0['bbox']) if i not in remove_index_list]
+        
+        return df_dict_0
+        
     
     def separate_tables(df):
         first_text = df.iloc[0].dropna().tolist()
@@ -144,6 +204,26 @@ def get_best_table_camelot(pdf_path, pages='all'):
                         else:
                             return i
             return None
+        
+        def check_first_last_col(df, col):
+            df_col = df.iloc[1:, col].replace({None: pd.NA, "": pd.NA}).dropna()
+            if len(df_col) < 3:
+                return [df]
+            # print(f'df_last: \n{df_last}')
+            df_count_n = df_col.apply(lambda x: x.count('\n'))
+            num = len([e for e in df_count_n.values if e>0])
+            perc = num/len(df_col)
+            # print(f'df_count_n:\n{df_count_n}', '\n', perc)
+            if len(set(df_count_n.values)) <= 2 and perc>=0.6: 
+                print('Separate last column!')
+                df_1 = df.drop(df.columns[col], axis=1)
+                df_2 = df.iloc[:, col]
+                df_split = df_2.str.split('\n', expand=True)
+                df_split.columns = [i for i in range(df_split.shape[1])]
+                df_list = [df_1, df_split]
+                return df_list
+            return [df]
+            
         num = df.shape[0]
         df_1 = df.replace({None: pd.NA, '': pd.NA})
         df_1.columns = list(range(df.shape[1]))
@@ -156,32 +236,30 @@ def get_best_table_camelot(pdf_path, pages='all'):
             df_list = [df.iloc[:, :col], df.iloc[:, col:]]
             return df_list
         
-        # check the last column
+        # check the first and last column
+        dfs_list = []
+        df_1 = df.copy()
         if df.shape[1] > 4:
-            df_last = df.iloc[1:, -1].replace({None: pd.NA, "": pd.NA}).dropna()
-            if len(df_last) < 3:
-                return [df]
-            # print(f'df_last: \n{df_last}')
-            df_count_n = df_last.apply(lambda x: x.count('\n'))
-            num = len([e for e in df_count_n.values if e>0])
-            perc = num/len(df_last)
-            # print(f'df_count_n:\n{df_count_n}', '\n', perc)
-            if len(set(df_count_n.values)) <= 2 and perc>=0.8: 
-                print('Separate last column!')
-                df_1 = df.iloc[:, :-1]
-                df_2 = df.iloc[:, -1]
-                df_split = df_2.str.split('\n', expand=True)
-                df_split.columns = [i for i in range(df_split.shape[1])]
-                df_list = [df_1, df_split]
-                return df_list
-            
-                
+            for col in [0, -1]:
+                df_list = check_first_last_col(df_1, col)
+                if len(df_list)>1 and not dfs_list:
+                    dfs_list = df_list
+                    df_1 = df_list[0]
+                elif len(df_list)>1:
+                    dfs_list = dfs_list[1] + df_list
+                    df_1 = df_list[0]
+        if dfs_list:
+            return dfs_list
+        
         return [df]
+                    
+        
     
     def cal_none_perc(df):
-        num_none = df.isna().sum().sum()
+        num_none_col = df.iloc[0].isna().sum() # give more penalty for missing column names
+        num_none = df.iloc[1:].isna().sum().sum()
         num_total = df.shape[0] * df.shape[1]
-        none_perc = num_none/num_total
+        none_perc = (num_none_col*5 + num_none)/num_total
         return none_perc
     
     def examine_table(df, string_thre = 0.5, string_none_thre = 0.15):
@@ -395,9 +473,14 @@ def get_best_table_camelot(pdf_path, pages='all'):
             df = df.dropna(how='all')
             df = df.dropna(axis=1, how='all')
             if not df.empty and df.shape[1]>=2 and df.shape[0]>=2:
+                df = complement_cols(df)
                 df_valid_list.append(df)
                 bbox_valid_list.append(bbox_list[i])
-        df_dict[flavor] = {'df':df_valid_list, 'bbox': bbox_valid_list, 'page': pages}
+        with pdfplumber.open(pdf_path) as pdf:
+            page = pdf.pages[int(pages)-1]  
+            page_height = page.height        
+        df_dict[flavor] = remove_redundant_tables({'df':df_valid_list, 'bbox': bbox_valid_list, 'page': pages}, page_height)
+        
         
     # drop out if no df identified
     non_empty_flavor = [key for key in df_dict if len(df_dict.get(key).get('df'))>0]
@@ -901,6 +984,7 @@ if __name__ == "__main__":
     # test 
     pdf_path = "./data/SR/Totalenergies_2024.pdf"
     # pdf_path = "./data/table/Totalenergies_2024 (dragged) 2.pdf"
-    pdf_path = './data/SR/LGES_2020.pdf'
+    # pdf_path = './data/SR/LGES_2020.pdf'
+    # pdf_path = './data/table/Totalenergies_2024 (dragged) 4.pdf'
     df_dict_list = detect_extract_tables(pdf_path, save_tables=True)
-    
+    # print(df_dict_list)
