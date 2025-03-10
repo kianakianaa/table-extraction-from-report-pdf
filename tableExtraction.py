@@ -89,7 +89,11 @@ def detect_tables(pdf_path):
 
 
 def read_tables_camelot(src, flavor, pages):
-    tables = camelot.read_pdf(src, flavor=flavor, pages=pages, suppress_stdout=True)
+    if flavor == 'lattice':
+        tables = camelot.read_pdf(src, flavor=flavor, pages=pages, suppress_stdout=True)
+    else:
+        tables = camelot.read_pdf(src, flavor=flavor, pages=pages, suppress_stdout=True)
+
     table_list = [] 
     position_list = []  
     
@@ -101,18 +105,74 @@ def read_tables_camelot(src, flavor, pages):
     return table_list, position_list
 
 def get_best_table_camelot(pdf_path, pages='all'):    
-    
+    def unpack_rows(df):
+        """ 
+        if there is no pattern of number of \n, then just leave it unchanged, which later will be deprecated by None check
+        """
+        def count_segments(df_col):
+            df_col = df_col.dropna().astype(str)
+            counts = [len(e.split('\n')) for e in df_col]
+            num = sum(counts)
+            return num
+        
+        def most_frequent_number(count_list):
+            count = Counter(count_list)
+            most_common = count.most_common(1)
+            if most_common and most_common[0][1] > 1:
+                return most_common[0][0]
+            return None
+        
+        # premise: Missing values (to mitigate collateral mistakes, stick to stirct conditions)
+        col_count_df = df.apply(count_segments, axis=0)
+        if df.shape[1] < 2:
+            return pd.DataFrame()
+        
+        mode = most_frequent_number(col_count_df.tolist())
+        print(f'mode: {mode}, entries_num:{df.shape[0]}')
+        if not mode or mode<=2*df.shape[0] or df.shape[0]<=2:
+            return df
+        print('Unpack rows..')
+        df_1 = pd.DataFrame(np.zeros((mode, df.shape[1])), columns=df.columns).astype(str)
+        string_list = ['\n'.join(pd.Series(c).dropna().astype(str)) for c in df.values.T]
+        elements_list = [s.split('\n') for s in string_list]
+        for i, l in enumerate(elements_list):
+            num = len(l)
+            if num==mode:
+                df_1.iloc[:, i] = l
+            elif num > mode:
+                n = num//mode
+                m = num%mode
+                list_1 = []
+                for k in range(mode - 1):
+                    list_1.append('\n'.join(map(str, l[n * k : n * (k + 1)])))
+                list_1.append('\n'.join(map(str, l[-m:])))
+                df_1.iloc[:, i] = list_1
+            else:
+                list_1 = l + ['']*(mode-num)
+                df_1.iloc[:, i] = list_1
+        # print(f'Get df_1: {df_1}')
+        return df_1
+        
     def complement_cols(df):
         # for numeric value based tables
         if df.empty or df.shape[0]<=1 or df.shape[1]<=1:
             return df
+        
+        df_1 = df.copy()
+        # check column names
         numeric_num = (df.iloc[:, 1:].map(pd.to_numeric, errors='coerce').notnull()).sum().sum()
         numeric_perc = numeric_num/(df.shape[0]*df.shape[1]-df.shape[0])
-        if numeric_perc >= 0.7:
-            if pd.to_numeric(df.iloc[0], errors='coerce').notnull().sum()>1:
-                df_1 = pd.concat([pd.DataFrame([[None]*df.shape[1]]), df]).reset_index(drop=True)
-                return df_1
-        return df
+        print(f'numeric_perc for col complementary: {numeric_perc}')
+        if numeric_perc >= 0.6:
+            if pd.to_numeric(df_1.iloc[0], errors='coerce').notnull().sum()>1:
+                df_1 = pd.concat([pd.DataFrame([[None]*df_1.shape[1]]), df_1]).reset_index(drop=True)
+                # return df_1
+                # check index
+                if pd.to_numeric(df_1.iloc[:, 0], errors='coerce').notnull().sum()>1:
+                    new_col = pd.Series([None] * df_1.shape[0])
+                    df_1 = pd.concat([new_col, df_1], axis=1).reset_index(drop=True)
+        df_1.columns = pd.RangeIndex(start=0, stop=df_1.shape[1], step=1)
+        return df_1
     
     def remove_redundant_tables(df_dict_0, page_height):
         """
@@ -147,7 +207,7 @@ def get_best_table_camelot(pdf_path, pages='all'):
                     target_df = df_dict_0['df'][i]
                     candi_info = candi_df.shape[0]*candi_df.shape[1] - candi_df.isna().sum().sum()
                     target_info = target_df.shape[0]*target_df.shape[1] - target_df.isna().sum().sum()
-                    if candi_info > target_info:
+                    if candi_info > target_info and candi_df.shape[1] >= target_df.shape[1]:
                         # print(f'Remove table {i}')
                         remove_index_list.append(i)
                         break
@@ -257,9 +317,10 @@ def get_best_table_camelot(pdf_path, pages='all'):
     
     def cal_none_perc(df):
         num_none_col = df.iloc[0].isna().sum() # give more penalty for missing column names
-        num_none = df.iloc[1:].isna().sum().sum()
+        num_none_idx = df.iloc[:, 0].isna().sum()
+        num_none = df.iloc[1:, 1:].isna().sum().sum()
         num_total = df.shape[0] * df.shape[1]
-        none_perc = (num_none_col*5 + num_none)/num_total
+        none_perc = (num_none_col*5 + num_none + num_none_idx*2)/num_total
         return none_perc
     
     def examine_table(df, string_thre = 0.5, string_none_thre = 0.15):
@@ -469,6 +530,7 @@ def get_best_table_camelot(pdf_path, pages='all'):
             
         for i, df in enumerate(df_list):
             # check validness of df
+            df = unpack_rows(df)
             df = examine_table(df)
             df = df.dropna(how='all')
             df = df.dropna(axis=1, how='all')
@@ -486,6 +548,8 @@ def get_best_table_camelot(pdf_path, pages='all'):
     non_empty_flavor = [key for key in df_dict if len(df_dict.get(key).get('df'))>0]
     if len(non_empty_flavor)==1:
         flavor = non_empty_flavor[0]
+        
+        
     else:
         # check the missing value percentage
         # step 1: compare general missing percentage 
@@ -505,6 +569,8 @@ def get_best_table_camelot(pdf_path, pages='all'):
     final_table_dict = df_dict[flavor]
     
     return final_table_dict, df_dict # df_dict
+
+
 
 def is_non_year_numeric(value):
     # Remove commas (thousands separators)
@@ -985,6 +1051,6 @@ if __name__ == "__main__":
     pdf_path = "./data/SR/Totalenergies_2024.pdf"
     # pdf_path = "./data/table/Totalenergies_2024 (dragged) 2.pdf"
     # pdf_path = './data/SR/LGES_2020.pdf'
-    # pdf_path = './data/table/Totalenergies_2024 (dragged) 4.pdf'
+    # pdf_path = './data/table/Totalenergies_2024 (dragged) 5.pdf'
     df_dict_list = detect_extract_tables(pdf_path, save_tables=True)
     # print(df_dict_list)
