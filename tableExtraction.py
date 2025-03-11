@@ -8,6 +8,7 @@ from collections import Counter
 from pathlib import Path
 from shapely.geometry import box
 from shapely.strtree import STRtree
+import unicodedata
 
 # to do (after extraction): interconnection of tables from the same page: missing column/index names
 
@@ -22,6 +23,8 @@ def detect_extract_tables(pdf_path, save_tables=True):
     for page_num in table_pages:
         print(f'\nProcessing page {page_num}..')
         df_dict_list_page = get_page_tables_adjusted(pdf_path, page_num, save_tables=False, start_idx=table_num)
+        if not df_dict_list_page:
+            continue
         table_num += len(df_dict_list_page)
         df_dict_list_all += df_dict_list_page
     
@@ -41,6 +44,9 @@ def get_page_tables_adjusted(pdf_path, page_num, save_tables=True, start_idx=0):
     # print(table_dict['df'])
     # print(df_dict_flavors)
     
+    if not table_dict:
+        return []
+    
     # refine/cleaning: go through each one
     # element in df_dict_list = {'title': title, 'df': df, 'page': page_string, bbox':bbox} for each table
     df_dict_list = [clean_table_df(table_df) for table_df in table_dict['df']] 
@@ -49,29 +55,28 @@ def get_page_tables_adjusted(pdf_path, page_num, save_tables=True, start_idx=0):
         df_dict_list[i]['page'] = page_num
     df_dict_list = [df_dict for df_dict in df_dict_list if not df_dict['df'].empty]
     
-    if len(df_dict_list) == 0:
-        print(f'No table for page {page_num}')
-        return []
-    else:
-        print(f'num of cleaned df: {len(df_dict_list)}')
-    
     # update bbox
     # refined_plumber_bbox = find_table_position(table_df, pdf_file, table_bbox, page_num=0)
     df_dict_list_1 = list(map(lambda df_dict: {**df_dict, 'bbox': find_table_position(df_dict['df'], pdf_path, df_dict['bbox'], page_num)}, df_dict_list))
+    # final sanity check after update the position
+    index_remove = remove_redundant_tables(
+        {'df': [df_dict['df'] for df_dict in df_dict_list_1], 'bbox':[df_dict['bbox'] for df_dict in df_dict_list_1]}, 
+        'pdfplumber'
+    )
+    df_dict_list_2 = [d for i,d in enumerate(df_dict_list_1) if i not in index_remove]
     # adjust column order  (page_num=0)
-    df_dict_list_2 = list(map(lambda df_dict_1: {**df_dict_1, 'df': adjust_column_name_order(df_dict_1['bbox'], df_dict_1['df'], pdf_path, page_num)}, df_dict_list_1))
-    if [df_dict for df_dict in df_dict_list_2 if len(df_dict['df'])>0]:
-        print(f'page {page_num} got final df!')
+    df_dict_list_3 = list(map(lambda df_dict_2: {**df_dict_2, 'df': adjust_column_name_order(df_dict_2['bbox'], df_dict_2['df'], pdf_path, page_num)}, df_dict_list_2))
         
-    # check table consistency in the page: missing index/column names
-        
+    if [df_dict for df_dict in df_dict_list_3 if len(df_dict['df'])>0]:
+        print(f'page {page_num} got {len(df_dict_list_3)} final df!')
+    
     #  save df_dict_list into xlsx, each df_dict into an independent sheet, with the sheetname being its title (if title is none then just use Sheet + number)
     if save_tables:
         xlsx_name = Path(pdf_path).stem + '.xlsx'
         xlsx_dir = './output/table'
         xlsx_path = Path(xlsx_dir) / xlsx_name
         xlsx_path.parent.mkdir(parents=True, exist_ok=True) 
-        save_tables_to_xlsx(df_dict_list_2, xlsx_path, start_idx)
+        save_tables_to_xlsx(df_dict_list_3, xlsx_path, start_idx)
     
     return df_dict_list_2
 
@@ -88,11 +93,66 @@ def detect_tables(pdf_path):
     return table_pages
 
 
-def read_tables_camelot(src, flavor, pages):
-    if flavor == 'lattice':
-        tables = camelot.read_pdf(src, flavor=flavor, pages=pages, suppress_stdout=True)
+
+def remove_redundant_tables(df_dict_0, bbox_type, page_height=None):
+    """
+    Background:
+    - There are cases that the table may be extracted multiple times but differently, which may lead the algorithm choosing the wrong option
+    
+    Method:
+    - check bbox
+    - content (TBD)
+    """        
+    # print(f'camelot_bbox:{df_dict_0['bbox']}')
+    num = len(df_dict_0['df'])
+    index_remove = []
+    df_list = df_dict_0['df']
+    bbox_list = df_dict_0['bbox']
+    for i in range(num):
+        if df_list[i].empty or i > len(bbox_list) - 1 or bbox_list[i] is None:
+            index_remove.append(i)
+    df_dict_0 = {'df': [df for i, df in enumerate(df_list) if i not in index_remove], 'bbox':[b for i, b in enumerate(bbox_list) if i not in index_remove]}
+            
+    if bbox_type == 'camelot' and page_height:
+        bbox_list = [box(b[0], page_height - b[-1], b[2], page_height - b[1]) for b in df_dict_0['bbox']]
+    elif bbox_type == 'pdfplumber':
+        bbox_list = [box(b[0], b[3], b[2], b[1]) for b in df_dict_0['bbox']]
     else:
-        tables = camelot.read_pdf(src, flavor=flavor, pages=pages, suppress_stdout=True)
+        print('Wrong input in remove_redundant_tables!')
+        return []
+    # print(f'bbox_list{bbox_list}')
+    if len(bbox_list) <= 1:
+        return df_dict_0
+    # R-tree reduces unnecessary comparisons by organizing boxes hierarchically
+    print('Check containing ..')
+    tree = STRtree(bbox_list)    
+    remove_index_list = []
+    epsilon = 20
+    for i, bbox in enumerate(bbox_list):
+        possible_matches = tree.query(bbox)  # Fast spatial query
+        for j in possible_matches:
+            if i != j:
+                candidate = bbox_list[j]
+                # print(f'candidate {j}; target:{i}')
+            else:
+                continue
+            if candidate != bbox and candidate.buffer(epsilon).contains(bbox):  # Ensure not the same object(maybe result of separate tables)
+                # to be safe: check the information density (didn't check content)
+                print(f'{j} Contain {i} inside!')
+                candi_df = df_dict_0['df'][j]
+                target_df = df_dict_0['df'][i]
+                candi_info = candi_df.shape[0]*candi_df.shape[1] - candi_df.isna().sum().sum()
+                target_info = target_df.shape[0]*target_df.shape[1] - target_df.isna().sum().sum()
+                if candi_info > target_info and candi_df.shape[1] >= target_df.shape[1]:
+                    print(f'Remove table {i}')
+                    remove_index_list.append(i)
+                    break
+    
+    return remove_index_list
+
+
+def read_tables_camelot(src, flavor, pages):
+    tables = camelot.read_pdf(src, flavor=flavor, pages=pages, suppress_stdout=True)
 
     table_list = [] 
     position_list = []  
@@ -129,7 +189,7 @@ def get_best_table_camelot(pdf_path, pages='all'):
         
         mode = most_frequent_number(col_count_df.tolist())
         print(f'mode: {mode}, entries_num:{df.shape[0]}')
-        if not mode or mode<=2*df.shape[0] or df.shape[0]<=2:
+        if not mode or mode<=2*df.shape[0] or (df.shape[0]<=2 and mode<6):
             return df
         print('Unpack rows..')
         df_1 = pd.DataFrame(np.zeros((mode, df.shape[1])), columns=df.columns).astype(str)
@@ -151,7 +211,12 @@ def get_best_table_camelot(pdf_path, pages='all'):
                 list_1 = l + ['']*(mode-num)
                 df_1.iloc[:, i] = list_1
         # print(f'Get df_1: {df_1}')
-        return df_1
+        
+        df_2 = df_1.map(lambda x: re.sub(r"(?<!\n)[ \t\r]+(?!\n)", " ", 
+                            unicodedata.normalize("NFKC", x.replace("*", "")))
+            .replace("\u202f", "")  # remove the narrow no-break space
+            .strip() if isinstance(x, str) else x)
+        return df_2
         
     def complement_cols(df):
         # for numeric value based tables
@@ -162,7 +227,7 @@ def get_best_table_camelot(pdf_path, pages='all'):
         # check column names
         numeric_num = (df.iloc[:, 1:].map(pd.to_numeric, errors='coerce').notnull()).sum().sum()
         numeric_perc = numeric_num/(df.shape[0]*df.shape[1]-df.shape[0])
-        print(f'numeric_perc for col complementary: {numeric_perc}')
+        # print(f'numeric_perc for col complementary: {numeric_perc}')
         if numeric_perc >= 0.6:
             if pd.to_numeric(df_1.iloc[0], errors='coerce').notnull().sum()>1:
                 df_1 = pd.concat([pd.DataFrame([[None]*df_1.shape[1]]), df_1]).reset_index(drop=True)
@@ -173,56 +238,16 @@ def get_best_table_camelot(pdf_path, pages='all'):
                     df_1 = pd.concat([new_col, df_1], axis=1).reset_index(drop=True)
         df_1.columns = pd.RangeIndex(start=0, stop=df_1.shape[1], step=1)
         return df_1
-    
-    def remove_redundant_tables(df_dict_0, page_height):
-        """
-        Background:
-        - There are cases that the table may be extracted multiple times but differently, which may lead the algorithm choosing the wrong option
-        
-        Method:
-        - check bbox
-        - content (TBD)
-        """        
-        # print(f'camelot_bbox:{df_dict_0['bbox']}')
-        bbox_list = [box(b[0], page_height - b[-1], b[2], page_height - b[1]) for b in df_dict_0['bbox']]
-        if len(bbox_list) <= 1:
-            return df_dict_0
-        # R-tree reduces unnecessary comparisons by organizing boxes hierarchically
-        # print('Check containing ..')
-        tree = STRtree(bbox_list)    
-        remove_index_list = []
-        epsilon = 5
-        for i, bbox in enumerate(bbox_list):
-            possible_matches = tree.query(bbox)  # Fast spatial query
-            for j in possible_matches:
-                if i != j:
-                    candidate = bbox_list[j]
-                    # print(f'candidate {candidate}; target:{bbox}')
-                else:
-                    continue
-                if candidate != bbox and candidate.buffer(epsilon).contains(bbox):  # Ensure not the same object(maybe result of separate tables)
-                    # to be safe: check the information density (didn't check content)
-                    # print('Contain inside!')
-                    candi_df = df_dict_0['df'][j]
-                    target_df = df_dict_0['df'][i]
-                    candi_info = candi_df.shape[0]*candi_df.shape[1] - candi_df.isna().sum().sum()
-                    target_info = target_df.shape[0]*target_df.shape[1] - target_df.isna().sum().sum()
-                    if candi_info > target_info and candi_df.shape[1] >= target_df.shape[1]:
-                        # print(f'Remove table {i}')
-                        remove_index_list.append(i)
-                        break
-        # update df_list
-        if remove_index_list:
-            df_dict_0['df'] = [df for i, df in enumerate(df_dict_0['df']) if i not in remove_index_list]
-            df_dict_0['bbox'] = [b for i, b in enumerate(df_dict_0['bbox']) if i not in remove_index_list]
-        
-        return df_dict_0
         
     
     def separate_tables(df):
+        """
+        horizonally total same columns
+        """
         first_text = df.iloc[0].dropna().tolist()
         first_text = [x for x in first_text if x != '']
         if len(first_text)>=4:
+            # print('check whether have multiple tables horizontally')
             if len(first_text)%2 == 0:
                 first_half = first_text[:int(len(first_text)/2)]
                 second_half = first_text[int(len(first_text)/2):]
@@ -235,7 +260,7 @@ def get_best_table_camelot(pdf_path, pages='all'):
                         column_index = true_indices[0]
                         # print(f'column_index:{column_index}')
                         df_list = [df.iloc[:, :column_index+1], df.iloc[:, column_index+1:]]
-                        # print(f'separate:\n{df_list[0]}')
+                        # print(f'Separate tables horizontally!')
                         return df_list 
             else:
                 first_half = first_text[:int((len(first_text)-1)/2)]
@@ -321,6 +346,7 @@ def get_best_table_camelot(pdf_path, pages='all'):
         num_none = df.iloc[1:, 1:].isna().sum().sum()
         num_total = df.shape[0] * df.shape[1]
         none_perc = (num_none_col*5 + num_none + num_none_idx*2)/num_total
+        
         return none_perc
     
     def examine_table(df, string_thre = 0.5, string_none_thre = 0.15):
@@ -540,9 +566,12 @@ def get_best_table_camelot(pdf_path, pages='all'):
                 bbox_valid_list.append(bbox_list[i])
         with pdfplumber.open(pdf_path) as pdf:
             page = pdf.pages[int(pages)-1]  
-            page_height = page.height        
-        df_dict[flavor] = remove_redundant_tables({'df':df_valid_list, 'bbox': bbox_valid_list, 'page': pages}, page_height)
-        
+            page_height = page.height    
+                
+        remove_index_list = remove_redundant_tables({'df':df_valid_list, 'bbox': bbox_valid_list}, 'camelot', page_height)
+        df_list = [df for i, df in enumerate(df_valid_list) if i not in remove_index_list]
+        bbox_list = [b for i, b in enumerate(bbox_valid_list) if i not in remove_index_list]
+        df_dict[flavor] = {'df': df_list, 'bbox': bbox_list, 'page': pages}
         
     # drop out if no df identified
     non_empty_flavor = [key for key in df_dict if len(df_dict.get(key).get('df'))>0]
@@ -555,6 +584,23 @@ def get_best_table_camelot(pdf_path, pages='all'):
         # step 1: compare general missing percentage 
         none_perc_dict = {key: [cal_none_perc(df) for df in df_dict[key]['df']] for key in non_empty_flavor}
         overall_none_perc_dict = {key: np.mean(none_perc_dict[key]) for key in non_empty_flavor}
+        print(f'original overall_none_perc_dict: {overall_none_perc_dict}')
+        # add penalty if all tables has no column names
+        overall_none_perc_dict = {key: value for key, value in overall_none_perc_dict.items() if value <0.75}
+        if not overall_none_perc_dict:
+            print('No table df extracted!')
+            return {}, {}
+        
+        for key in overall_none_perc_dict.keys():
+            missing_columns = []
+            if df_dict.get(key):
+                dfs = df_dict[key]['df']
+                missing_columns = [i for i, df in enumerate(dfs) if df.iloc[0].notna().sum() <= 1]
+                # print(f'missing_columns for {key}: {len(missing_columns)}')
+                if len(missing_columns) == len(dfs):
+                    overall_none_perc_dict[key] += 0.2*len(dfs)
+        
+        print(f'overall_none_perc_dict: {overall_none_perc_dict}')
         min_none_perc = {key: value for key, value in overall_none_perc_dict.items() if value == min(overall_none_perc_dict.values())}
         if len(min_none_perc) == 1:
             flavor = list(min_none_perc.keys())[0]
@@ -611,12 +657,16 @@ def clean_table_df(df):
         third_row_text = '_'.join(third_row)   
         third_row_nume = sum([int(is_non_year_numeric(e)) for e in third_row]) 
         num_lines_3 = third_row_text.count('\n') 
+        # numeric_num = (df.iloc[:, 1:].map(pd.to_numeric, errors='coerce').notnull()).sum().sum()
+        # numeric_perc = numeric_num/(df.shape[0]*df.shape[1]-df.shape[0])
+        # print(f'numeric_perc:{numeric_perc}')
         # Case 2: both first and second row has None, but can be combined into one row -> no title, first two rows merge into cols
         if sum(combined_2_row_c) == 0:
             print('First two rows as cols')
             cols = [str(l[0]) + str(l[1]) for l in combined_2_row]
             df_1 = df.iloc[2:]
             df_1.columns = cols
+            
         # Case 1: no missing values in first row -> column names, no title
         elif first_row[1:].count('') == 0 and 2* num_cols > num_lines_1 >=0 and first_row_nume<=2:
             print('First row as cols!')
@@ -653,8 +703,7 @@ def clean_table_df(df):
         else:
         # by default: no change (no column names in first three rows)   
             df_1 = df.copy()
-            # df_1.columns = list(range(df_1.shape[1]))
-        
+                    
         return  df_1, title, cols_text
     
     # identify column names: when cols_text is not ''
@@ -741,6 +790,9 @@ def clean_table_df(df):
         df_3 = df_2.copy()
         row = 0
         while row < df_3.shape[0]-1:
+            if row == 0 and all(pd.isna(df_3.iloc[0, 1:])) and pd.to_numeric(df_3.iloc[1, 1:], errors='coerce').notnull().sum()>=1:
+                row += 1
+                continue
             df_3 = detect_row(df_3, row)
             row += 1
                 
@@ -1051,6 +1103,6 @@ if __name__ == "__main__":
     pdf_path = "./data/SR/Totalenergies_2024.pdf"
     # pdf_path = "./data/table/Totalenergies_2024 (dragged) 2.pdf"
     # pdf_path = './data/SR/LGES_2020.pdf'
-    # pdf_path = './data/table/Totalenergies_2024 (dragged) 5.pdf'
+    pdf_path = './data/table/Totalenergies_2024 (dragged) 4.pdf'
     df_dict_list = detect_extract_tables(pdf_path, save_tables=True)
-    # print(df_dict_list)
+    print(df_dict_list)
