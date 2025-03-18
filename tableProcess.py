@@ -6,7 +6,6 @@ import unicodedata
 import json
 import datetime
 import os
-import tableExtraction
 
 def get_numeric_table(df):
     """ 
@@ -595,8 +594,12 @@ def tabledict_to_json(sheets_dict, file_name, to_excel=True, to_json=True, outpu
             for sheet_name, df in sheets_dict_1.items():
                 # Save each dataframe to a separate sheet
                 sheet_name_cut = sheet_name[-31:] if len(sheet_name)>31 else sheet_name
-                df = combine_units_with_values(df)
-                df.to_excel(writer, sheet_name=sheet_name_cut, index=True)
+                if not df.empty:
+                    df = combine_units_with_values(df)
+                    df.to_excel(writer, sheet_name=sheet_name_cut, index=True)
+                else:
+                    continue
+        print(f'Excel has been saved to {output_file}')
     return sheets_dict_1
         
 

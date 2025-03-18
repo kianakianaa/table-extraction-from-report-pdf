@@ -543,6 +543,19 @@ def get_best_table_camelot(pdf_path, flavor_list, pages='all'):
         
         return none_perc
     
+    def get_numeric_table(df):
+        """ 
+        If has enough numeric data, return the df (remove * and unicode), otherwise return empty df
+        """
+        numeric_perc = df.iloc[:, 1:].map(cal_numeric_values).mean().mean()
+        none_perc = df.isna().mean().mean()
+        # print(f'numerc_perc:{numeric_perc}')
+        if numeric_perc >= 0.2 and none_perc<=0.8:  # small threshold considering tables may not in good structure
+            df = df.map(lambda x: re.sub(r"(?<!\n)[ \t\r]+(?!\n)", " ", x)
+                .strip() if isinstance(x, str) else x)
+            return df
+        return pd.DataFrame() 
+    
     def examine_table(df, string_thre = 0.5, string_none_thre = 0.15):
         """ 
         Goal: remove invalid values if the whole table is invalid, will return an empty dataframe.
@@ -743,13 +756,12 @@ def get_best_table_camelot(pdf_path, flavor_list, pages='all'):
             df = examine_table(df)
             df = df.dropna(how='all')
             df = df.dropna(axis=1, how='all')
+            df = get_numeric_table(df)
             if not df.empty and df.shape[1]>=2 and df.shape[0]>=2:
                 df = complement_cols(df)
                 df_valid_list.append(df)
                 bbox_valid_list.append(bbox_list_0[i])
-        
-                
-                
+     
         with pdfplumber.open(pdf_path) as pdf:
             page = pdf.pages[int(pages)-1]  
             page_height = page.height    
@@ -1437,5 +1449,5 @@ if __name__ == "__main__":
     # pdf_path = "./data/table/Totalenergies_2024 (dragged) 2.pdf"
     # pdf_path = './data/SR/LGES_2020.pdf'
     # pdf_path = './data/table/Totalenergies_2024 (dragged) 104.pdf'
-    sheets_dict, df_dict_list = detect_extract_tables(pdf_path, save_tables=True)
+    # sheets_dict, df_dict_list = detect_extract_tables(pdf_path, save_tables=True)
     # print(sheets_dict)
