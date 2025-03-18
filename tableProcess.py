@@ -283,14 +283,15 @@ def combine_rows(df):
     # print(f'combine down rows:{combine_down_rows}')
     df_1 = df.copy()
     # use index name instead of index (removing row may change the idnex but not the name)
-    for i in range(df.shape[0]):
+    for i in range(df_1.shape[0]-1, -1, -1):  # Iterate in reverse to avoid index shift
         if i in combine_up_rows:
-            df_1.loc[i-1] = df.loc[i-1].astype(str).where(df.loc[i-1].notna(), '') + ' ' + df.loc[i].astype(str).where(df.loc[i].notna(), '')
-            # print(df_1.loc[i].tolist())
-            df_1.drop(index=[i], inplace=True)
+            if i > 0:  # Ensure there is a previous row to combine with
+                df_1.loc[i-1] = df.loc[i-1].astype(str).where(df.loc[i-1].notna(), '') + ' ' + df.loc[i].astype(str).where(df.loc[i].notna(), '')
+                df_1.drop(index=[i], inplace=True)
         elif i in combine_down_rows:
-            df_1.iloc[i+1] = df.loc[i].astype(str).where(df.loc[i].notna(), '') + ' ' + df.loc[i+1].astype(str).where(df.loc[i+1].notna(), '')
-            df_1.drop(index=[i], inplace=True)
+            if i+1 < df_1.shape[0]:  # Ensure there is a next row to combine with
+                df_1.iloc[i+1] = df.loc[i].astype(str).where(df.loc[i].notna(), '') + ' ' + df.loc[i+1].astype(str).where(df.loc[i+1].notna(), '')
+                df_1.drop(index=[i], inplace=True)
     
     df_1 = df_1.reset_index(drop=True)
     return df_1
@@ -461,7 +462,8 @@ def get_most_recent_year_data(df):
     
     df.columns = pd.to_numeric(df.columns, errors='coerce')
     most_recent_year = max(valid_year_columns)
-    most_recent_data = df[most_recent_year] # reserve index
+    idx = list(df.columns).index(most_recent_year)
+    most_recent_data = df.iloc[:, idx] # reserve index
 
     return most_recent_data.to_frame(name=most_recent_year)
 
@@ -480,7 +482,9 @@ def combine_units_with_values(df):
     unit_col = ''
     # print(df.columns)
     for col in df.columns:
-        if isinstance(col, str) and "unit" in col.lower() and df[col].dtype==object and len(set(df[col]))<df.shape[0]:
+        # print(df.columns, col)
+        cols = df.columns.tolist()
+        if len(set(cols)) == len(cols) and isinstance(col, str) and "unit" in col.lower() and df[col].dtype==object and len(set(df[col]))<df.shape[0]*0.7:
             unit_col = col
             print(f'find unit col:{col}')
             break
@@ -590,8 +594,9 @@ def tabledict_to_json(sheets_dict, file_name, to_excel=True, to_json=True, outpu
         with pd.ExcelWriter(output_file, engine='xlsxwriter') as writer:
             for sheet_name, df in sheets_dict_1.items():
                 # Save each dataframe to a separate sheet
+                sheet_name_cut = sheet_name[-31:] if len(sheet_name)>31 else sheet_name
                 df = combine_units_with_values(df)
-                df.to_excel(writer, sheet_name=sheet_name, index=True)
+                df.to_excel(writer, sheet_name=sheet_name_cut, index=True)
     return sheets_dict_1
         
 
@@ -603,7 +608,7 @@ if __name__ == "__main__":
     sheets_dict = pd.read_excel(file_path, sheet_name=None)  
     file_name_with_extension = os.path.basename(file_path)
     file_name = os.path.splitext(file_name_with_extension)[0]
-    sheets_dict_1 = tabledict_to_json(sheets_dict, file_name, to_excel=True, to_json=True, output_dir=output_dir)
+    # sheets_dict_1 = tabledict_to_json(sheets_dict, file_name, to_excel=True, to_json=True, output_dir=output_dir)
     
     
     

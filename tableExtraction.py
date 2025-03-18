@@ -10,19 +10,155 @@ from shapely.geometry import box
 from shapely.strtree import STRtree
 import unicodedata
 
-# to do (after extraction): interconnection of tables from the same page: missing column/index names
+import fitz
+from PIL import Image
+import io
+import cv2
+import numpy as np
+
+def remove_text_from_rect(page, rect):
+    """
+    Removes text from a given rectangular area on the page by deleting the text content.
+
+    Parameters:
+    - page (fitz.Page): The page object.
+    - rect (fitz.Rect): The rectangular area where text should be removed.
+    """
+    page.add_redact_annot(rect)  # This marks the area for redaction
+    
+    # Apply the redactions (remove text) from the page
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+    
+    
+def save_cropped_pdf(doc, page_num, split_column, new_doc):
+    """
+    Splits a PDF page into left and right parts and fully removes the unwanted content.
+
+    Parameters:
+    - doc (fitz.Document): The original PDF document.
+    - page_num (int): The page number to split.
+    - split_column (float): The x-coordinate at which the page should be split.
+    - new_doc (fitz.Document): The new PDF document where the cropped pages will be added.
+    """
+    page = doc[page_num]
+    page_width = page.rect.width
+    page_height = page.rect.height
+
+    left_rect = fitz.Rect(0, 0, split_column, page_height)
+    right_rect = fitz.Rect(split_column, 0, page_width, page_height)
+    new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+    remove_text_from_rect(new_doc[-1], right_rect)
+    new_doc[-1].set_cropbox(left_rect)
+    
+    new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+    remove_text_from_rect(new_doc[-1], left_rect)
+    new_doc[-1].set_cropbox(right_rect)
+    
+    return new_doc
+
+def fitz_rect_to_camelot_bbox(fitz_rect, page_height):
+    """
+    Convert a FitZ Rect to Camelot's bbox format (left, top, right, bottom).
+    
+    Args:
+        fitz_rect: The fitz.Rect object.
+        page_height: The height of the page, which is necessary to adjust the y-axis (since FitZ and Camelot have different y-axis origins).
+        
+    Returns:
+        tuple: A tuple representing the bbox in Camelot format (left, top, right, bottom).
+    """
+    # FitZ Rect has: x0, y0, x1, y1
+    # Camelot expects bbox in format: (left, top, right, bottom)
+    if fitz_rect == 'All':
+        return ['All']
+    left = fitz_rect.x0
+    right = fitz_rect.x1
+    top = page_height - fitz_rect.y0  
+    bottom = page_height - fitz_rect.y1  
+    bbox = [left, top, right, bottom]
+    return list(map(str, bbox))
+
+
+def split_pdf_at_gap(pdf_path, pages_to_split, threshold_length=300, high_intensity=250):
+    """
+    Splits a PDF at a detected gap in the middle third of each specified page and saves the result as a new text-based PDF.
+    
+    Parameters:
+    - pdf_path (str): Path to the input PDF file.
+    - pages_to_split (list): List of page indices that contain tables and should be split.
+    - threshold_length (int): Length of the high-intensity region required to be considered a gap.
+    - high_intensity (int): Pixel intensity threshold for detecting a gap (higher value indicates a gap).
+    """
+    doc = fitz.open(pdf_path)
+    new_doc = fitz.open()  # Create a new PDF document
+
+    for page_num in pages_to_split:
+        page = doc.load_page(page_num)
+        page_height = page.rect.height
+        page_width = page.rect.width
+
+        # Convert the page to an image for analysis
+        pix = page.get_pixmap(dpi=300)
+        image = Image.open(io.BytesIO(pix.tobytes("png")))
+        image_np = np.array(image)
+        gray = cv2.cvtColor(image_np, cv2.COLOR_RGBA2GRAY)
+
+        height, width = gray.shape
+        image_page_ratio = height / page_height
+        start_col = width // 3
+        end_col = 2 * width // 3
+        middle_image = gray[:, start_col:end_col]
+        histogram = np.mean(middle_image, axis=0)
+        high_intensity_region = []
+        gap_start, gap_end = None, None  
+
+        # Loop through the histogram to detect long sequences of high intensity values (gap)
+        for i in range(len(histogram)):
+            if histogram[i] > high_intensity:  
+                high_intensity_region.append(i)
+            else:
+                if len(high_intensity_region) > threshold_length:
+                    gap_start = high_intensity_region[0]
+                    gap_end = high_intensity_region[-1]
+                    break
+                high_intensity_region = []
+
+        if gap_start is None or gap_end is None:
+            print(f"No significant gap detected in page {page_num}. Inserting original page.")
+            # If no gap detected, just insert the original page (as a blank or empty page to maintain structure)
+            page = doc.load_page(page_num)  # Load the original page
+            new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+            # camelot_bboxes.append('All')
+        else:
+            split_column_img = start_col + gap_start + (gap_end - gap_start) // 2  
+            split_column = split_column_img / image_page_ratio
+            print(f"Splitting page {page_num} at column: {split_column}")
+            # Save cropped text-based pages into the new PDF document
+            new_doc = save_cropped_pdf(doc, page_num, split_column, new_doc)
+
+    # Save the new text-based PDF
+    new_pdf_path = pdf_path.replace('.pdf', '_split_text.pdf')
+    new_doc.save(new_pdf_path)
+    print(f"Saved the split text PDF: {new_pdf_path}")
+    page_count = new_doc.page_count
+    return new_pdf_path, page_count
+ 
 
 def detect_extract_tables(pdf_path, save_tables=True):
     print('Begin reading pdf...\n')
     
     table_pages = detect_tables(pdf_path)
-    print('Finish detecting tables!') 
+    print(f'Finish detecting tables:{table_pages}') 
+    # table_pages = [0]
+    
+    # check pdf separation and update table_pages
+    new_pdf_path, new_page_count = split_pdf_at_gap(pdf_path, table_pages)
     
     table_num = 0
     df_dict_list_all = []
-    for page_num in table_pages:
+    for page_num in range(new_page_count):
         print(f'\nProcessing page {page_num}..')
-        df_dict_list_page = get_page_tables_adjusted(pdf_path, page_num, save_tables=False, start_idx=table_num)
+        df_dict_list_page = get_page_tables_adjusted(new_pdf_path, page_num, save_tables=False, start_idx=table_num)
         if not df_dict_list_page:
             continue
         table_num += len(df_dict_list_page)
@@ -40,11 +176,11 @@ def detect_extract_tables(pdf_path, save_tables=True):
     return sheets_dict, df_dict_list_all  
 
 
-def get_page_tables_adjusted(pdf_path, page_num, save_tables=True, start_idx=0):
+def get_page_tables_adjusted(pdf_path, page_num, save_tables=True, start_idx=0, flavor_list = ['hybrid', 'lattice']):
     # extract: tablelist has no title or columns detected, pure list of df
-    table_dict, df_dict_flavors = get_best_table_camelot(pdf_path, ",".join(map(str, [page_num+1])))  
+    table_dict, df_dict_flavors = get_best_table_camelot(pdf_path, flavor_list, ",".join(map(str, [page_num+1])))  
     # print(table_dict['df'])
-    # print(df_dict_flavors)
+    print(df_dict_flavors)
     
     if not table_dict:
         return []
@@ -86,12 +222,15 @@ def get_page_tables_adjusted(pdf_path, page_num, save_tables=True, start_idx=0):
 def detect_tables(pdf_path):
     table_pages = []
     with pdfplumber.open(pdf_path) as pdf:
+        page_num = len(pdf.pages)
         for i, page in enumerate(pdf.pages):
             tables = page.extract_tables()
             if tables:
                 dfs = [pd.DataFrame(table) for table in tables if any(any(cell for cell in row) for row in table)]
                 if dfs:
                     table_pages.append(i)
+            elif 2 <= abs(i - page_num)<= 12:
+                table_pages.append(i)
     return table_pages
 
 
@@ -154,19 +293,19 @@ def remove_redundant_tables(df_dict_0, bbox_type, page_height=None):
 
 
 def read_tables_camelot(src, flavor, pages):
-    tables = camelot.read_pdf(src, flavor=flavor, pages=pages, suppress_stdout=True)
-
+    tables = camelot.read_pdf(src, flavor=flavor, pages=pages, suppress_stdout=True, strip_text=' ', split_text=True)
     table_list = [] 
     position_list = []  
     
     for table in tables:
         table_df = table.df
+        # print(table_df.head())
         table_list.append(table_df)
         position_list.append(table._bbox)  # (x1, y1, x2, y2)
     
     return table_list, position_list
 
-def get_best_table_camelot(pdf_path, pages='all'):    
+def get_best_table_camelot(pdf_path, flavor_list, pages='all'):    
     def unpack_rows(df):
         """ 
         if there is no pattern of number of \n, then just leave it unchanged, which later will be deprecated by None check
@@ -588,7 +727,6 @@ def get_best_table_camelot(pdf_path, pages='all'):
             
         return df
     
-    flavor_list = ['hybrid', 'lattice']  # , 'stream', 'network'
     flavor = 'hybrid' # by default
     
     # get results for different flavor
@@ -673,7 +811,7 @@ def get_best_table_camelot(pdf_path, pages='all'):
                     # need to make sure its non-numeric (column)
                     numeric_rows = df.iloc[:, 1:].map(cal_numeric_values).sum(axis=1)/df.shape[1]
                     idx_col = numeric_rows[numeric_rows >= 0.3] if (numeric_rows >= 0.3).any() else None
-                    if idx_col.index[0]==0:
+                    if idx_col is not None and idx_col.index[0]==0:
                         none_row = pd.DataFrame([[np.nan] * df.shape[1]], columns=df.columns)
                         df = pd.concat([none_row, df]).reset_index(drop=True)
                         dfs[i] = df
@@ -682,7 +820,7 @@ def get_best_table_camelot(pdf_path, pages='all'):
                     valid_rows = df.iloc[0:end].isna().sum(axis=1).lt(2)  
                     # print(f'valid_rows:\n{valid_rows}')
                     valid_indices = valid_rows[valid_rows].index
-                    valid_indices = [idx for idx in valid_indices if idx not in idx_col]
+                    valid_indices = [idx for idx in valid_indices if idx_col is not None and idx not in idx_col]
                     valid_index = min(valid_indices) if len(valid_indices)>0 else 0
                     # print(f'valid_index:{valid_index}, {df.iloc[valid_index]}')
                     valid_index_lst.append(valid_index)
@@ -822,6 +960,8 @@ def clean_table_df(df):
         first_row = df.iloc[0].fillna('').tolist()
         second_row = df.iloc[1].fillna('').tolist()
         third_row = df.iloc[2].fillna('').tolist()
+        first_row_all = df.iloc[0].astype(str)  # Ensure values are strings
+        all_uppercase_start = first_row_all.str.match(r"^[A-Z]")
         combined_2_row = [[first_row[i], second_row[i]] for i in range(num_cols)]
         combined_2_row_c = [(0 if l.count('')==1 else 1) for l in combined_2_row]
         
@@ -845,7 +985,7 @@ def clean_table_df(df):
             df_1.columns = cols
             
         # Case 1: no missing values in first row -> column names, no title
-        elif first_row[1:].count('') == 0 and 2* num_cols > num_lines_1 >=0 and first_row_nume<=2:
+        elif first_row[1:].count('') == 0 and 2* num_cols > num_lines_1 >=0 and first_row_nume<=2 and df.iloc[0].dtype==object and all(all_uppercase_start):
             print('First row as cols!')
             df_1 = df.iloc[1:]
             cols = first_row
@@ -1188,14 +1328,15 @@ def display_table_box(pdf_file, table_bbox, page_num=0, plumber_ordinate=1):
         plt.imshow(im.original)
         plt.axis('off')  
         plt.show()
-        
-def save_tables_to_xlsx(df_dict_list, output_path, start_idx):
-    def sanitize_sheet_name(name, page_num):
+       
+def sanitize_sheet_name(name, page_num):
     # Replace invalid characters with underscores and truncate to 31 characters
         name = re.sub(r'[\\/:*?"<>|]', '_', name)  
         limit = 31 - len(str(page_num)) - 1
         name = name[:limit] + '_' + str(page_num)
         return name
+     
+def save_tables_to_xlsx(df_dict_list, output_path, start_idx):
     df_dict_list = [df_dict for df_dict in df_dict_list if not df_dict['df'].empty]
     print(f'\nFinal num of df: {len(df_dict_list)}')
     # Use ExcelWriter to write multiple sheets
@@ -1292,9 +1433,9 @@ def adjust_column_name_order(plumber_bbox, cleaned_table_df, pdf_path, page_num=
 
 if __name__ == "__main__":
     # test 
-    pdf_path = "./data/SR/Totalenergies_2024.pdf"
+    pdf_path = "./data/SR/2023_longi-sustainability-report.pdf"
     # pdf_path = "./data/table/Totalenergies_2024 (dragged) 2.pdf"
     # pdf_path = './data/SR/LGES_2020.pdf'
     # pdf_path = './data/table/Totalenergies_2024 (dragged) 104.pdf'
     sheets_dict, df_dict_list = detect_extract_tables(pdf_path, save_tables=True)
-    print(sheets_dict)
+    # print(sheets_dict)
